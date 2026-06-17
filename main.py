@@ -1,13 +1,14 @@
 import argparse
 import shlex
 import asyncio
+import json
 
 from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.star import Context, Star
 from astrbot.api import logger, AstrBotConfig
 
 from .fetcher import fetch_player_data, fetch_player_stats, fetch_pandascore_matches, fetch_player_seasonal_stats, fetch_r6_wiki, fetch_game_online_stats
-from .formatter import format_new_overview, format_match_history
+from .formatter import format_new_overview, format_match_history, calculate_kd, calculate_winrate
 from .formatter3 import format_pandascore_matches
 from . import formatter_wiki as wiki_fmt
 
@@ -40,6 +41,185 @@ class R6StatesPlugin(Star):
         except Exception as e:
             logger.error(f"查询玩家 {player_id} 失败: {type(e).__name__}: {e}")
             return f"❌ 查询玩家 {player_id} 失败，可能是由于ID错误、网络延迟或 API 维护中。"
+
+    async def query_player_overview_raw(self, player_id: str) -> dict:
+        try:
+            api_key = self.config.get("api_key", "")
+
+            stats_task = fetch_player_stats(player_id, api_key)
+            ops_task = fetch_player_data(player_id, api_key)
+
+            stats_data, ops_data = await asyncio.gather(stats_task, ops_task)
+
+            if isinstance(stats_data, dict) and stats_data.get("error"):
+                return {
+                    "ok": False,
+                    "player_id": player_id,
+                    "error": stats_data.get("error")
+                }
+            if isinstance(ops_data, dict) and ops_data.get("error"):
+                return {
+                    "ok": False,
+                    "player_id": player_id,
+                    "error": ops_data.get("error")
+                }
+
+            season = []
+            rank = {
+                "season_id": "未知",
+                "max_rank": 0,
+                "max_rp": 0,
+                "current_rank": 0,
+                "current_rp": 0
+            }
+
+            profiles = stats_data.get("platform_families_full_profiles", []) if isinstance(stats_data, dict) else []
+            if isinstance(profiles, list) and profiles:
+                boards = profiles[0].get("board_ids_full_profiles", [])
+                if isinstance(boards, list):
+                    for board in boards:
+                        if not isinstance(board, dict):
+                            continue
+
+                        board_id = board.get("board_id", "")
+                        mode_names = {
+                            "ranked": "排位",
+                            "standard": "快速",
+                            "living_game_mode": "非排"
+                        }
+                        mode_name = mode_names.get(board_id)
+                        if not mode_name:
+                            continue
+
+                        inner_profiles = board.get("full_profiles", [])
+                        if not isinstance(inner_profiles, list) or not inner_profiles:
+                            continue
+
+                        profile_item = inner_profiles[0] if isinstance(inner_profiles[0], dict) else {}
+                        if board_id == "ranked":
+                            profile = profile_item.get("profile", {})
+                            if isinstance(profile, dict):
+                                rank = {
+                                    "season_id": profile.get("season_id", "未知"),
+                                    "max_rank": profile.get("max_rank", 0),
+                                    "max_rp": profile.get("max_rank_points", 0),
+                                    "current_rank": profile.get("rank", 0),
+                                    "current_rp": profile.get("rank_points", 0)
+                                }
+
+                        stats = profile_item.get("season_statistics", {})
+                        if not isinstance(stats, dict):
+                            stats = {}
+                        kills = stats.get("kills", 0)
+                        deaths = stats.get("deaths", 0)
+                        outcomes = stats.get("match_outcomes", {})
+                        if not isinstance(outcomes, dict):
+                            outcomes = {}
+                        wins = outcomes.get("wins", 0)
+                        losses = outcomes.get("losses", 0)
+                        abandons = outcomes.get("abandons", 0)
+
+                        season.append({
+                            "mode": mode_name,
+                            "kd": calculate_kd(kills, deaths),
+                            "winrate": calculate_winrate(wins, losses),
+                            "kills": kills,
+                            "deaths": deaths,
+                            "matches": wins + losses + abandons
+                        })
+
+            operator_plays = {}
+            split_data = ops_data.get("split", {}) if isinstance(ops_data, dict) else {}
+            if isinstance(split_data, dict):
+                pc_data = split_data.get("pc", {})
+                playlists = pc_data.get("playlists", {}) if isinstance(pc_data, dict) else {}
+                if isinstance(playlists, dict):
+                    for playlist_data in playlists.values():
+                        if not isinstance(playlist_data, dict):
+                            continue
+                        operators = playlist_data.get("operators", {})
+                        if not isinstance(operators, dict):
+                            continue
+                        for op_info in operators.values():
+                            if not isinstance(op_info, dict):
+                                continue
+                            name = op_info.get("operator", "Unknown")
+                            rounds = op_info.get("rounds", {})
+                            if not isinstance(rounds, dict):
+                                rounds = {}
+                            seasonal = rounds.get("seasonal", {})
+                            lifetime = rounds.get("lifetime", {})
+                            if not isinstance(seasonal, dict):
+                                seasonal = {}
+                            if not isinstance(lifetime, dict):
+                                lifetime = {}
+                            played = seasonal.get("played", 0)
+                            won = seasonal.get("won", 0)
+                            if played == 0:
+                                played = lifetime.get("played", 0)
+                                won = lifetime.get("won", 0)
+                            if name not in operator_plays:
+                                operator_plays[name] = {"played": 0, "won": 0}
+                            operator_plays[name]["played"] += played
+                            operator_plays[name]["won"] += won
+
+            top_operators = []
+            sorted_ops = sorted(operator_plays.items(), key=lambda x: x[1]["played"], reverse=True)
+            for name, data in [op for op in sorted_ops if op[1]["played"] > 0][:3]:
+                played = data.get("played", 0)
+                won = data.get("won", 0)
+                top_operators.append({
+                    "name": name,
+                    "played": played,
+                    "won": won,
+                    "winrate": calculate_winrate(won, played - won)
+                })
+
+            return {
+                "ok": True,
+                "player_id": player_id,
+                "season": season,
+                "rank": rank,
+                "top_operators": top_operators,
+                "reply_instruction": "请基于 data 用自然语言总结，不要逐字段复述 JSON，不要编造数据。"
+            }
+        except Exception as e:
+            logger.error(f"查询玩家 {player_id} 结构化数据失败: {type(e).__name__}: {e}")
+            return {
+                "ok": False,
+                "player_id": player_id,
+                "error": "查询玩家结构化数据失败，可能是由于ID错误、网络延迟或 API 维护中。"
+            }
+
+    async def generate_llm_tool_reply(self, event: AstrMessageEvent, title: str, data) -> str:
+        try:
+            provider_id = await self.context.get_current_chat_provider_id(event.unified_msg_origin)
+            persona = self.context.persona_manager.get_default_persona_v3(umo=event.unified_msg_origin)
+            if asyncio.iscoroutine(persona):
+                persona = await persona
+            persona_prompt = ""
+            if isinstance(persona, dict):
+                persona_prompt = persona.get("prompt", "")
+            else:
+                persona_prompt = getattr(persona, "prompt", "")
+
+            prompt = (
+                f"你正在扮演当前 AstrBot 人格，请严格遵守下面的人格设定来回复用户。\n"
+                f"【当前人格设定】\n{persona_prompt}\n\n"
+                f"【任务】\n"
+                f"请基于插件查询到的 {title} 数据，用自然语言给用户一个简洁、有帮助的回复。\n"
+                f"不要逐字段复述 JSON，不要编造数据；如果数据中包含 error 或 ok=false，请直接说明查询失败原因。\n\n"
+                f"【查询结果 JSON】\n"
+                f"{json.dumps(data, ensure_ascii=False)}"
+            )
+            llm_resp = await self.context.llm_generate(
+                chat_provider_id=provider_id,
+                prompt=prompt
+            )
+            return llm_resp.completion_text
+        except Exception as e:
+            logger.error(f"生成 R6 LLM Tool 回复失败: {type(e).__name__}: {e}")
+            return json.dumps(data, ensure_ascii=False)
 
     @filter.command("r6")
     async def r6_command(self, event: AstrMessageEvent, message: str = ""):
@@ -191,7 +371,8 @@ class R6StatesPlugin(Star):
         Args:
             player_id(string): 玩家的育碧(Ubisoft)游戏ID
         '''
-        res = await self.query_player_overview(player_id)
+        data = await self.query_player_overview_raw(player_id)
+        res = await self.generate_llm_tool_reply(event, f"玩家 {player_id} 战绩", data)
         yield event.plain_result(res)
 
     @filter.llm_tool(name="query_r6_esports_matches")
@@ -206,7 +387,7 @@ class R6StatesPlugin(Star):
             yield event.plain_result("❌ 未配置 pandascore_api_key。")
             return
         data = await fetch_pandascore_matches(query, api_key)
-        res = format_pandascore_matches(data)
+        res = await self.generate_llm_tool_reply(event, f"彩虹六号电竞比赛（{query}）", data)
         yield event.plain_result(res)
 
     @filter.llm_tool(name="query_r6_operator_info")
@@ -218,7 +399,8 @@ class R6StatesPlugin(Star):
         '''
         api_key = self.config.get("api_key", "")
         data = await fetch_r6_wiki("operators", api_key, params={"name": operator_name})
-        yield event.plain_result(wiki_fmt.format_operator_info(data, operator_name))
+        res = await self.generate_llm_tool_reply(event, f"干员 {operator_name} 百科", data)
+        yield event.plain_result(res)
 
 
     @filter.llm_tool(name="query_r6_game_online_status")
@@ -226,5 +408,5 @@ class R6StatesPlugin(Star):
         '''查看彩虹六号当前全球各平台的实时在线人数和注册用户统计。'''
         api_key = self.config.get("api_key", "")
         data = await fetch_game_online_stats(api_key)
-        yield event.plain_result(wiki_fmt.format_game_stats(data))
-
+        res = await self.generate_llm_tool_reply(event, "游戏在线状态", data)
+        yield event.plain_result(res)
