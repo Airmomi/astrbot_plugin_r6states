@@ -191,6 +191,36 @@ class R6StatesPlugin(Star):
                 "error": "查询玩家结构化数据失败，可能是由于ID错误、网络延迟或 API 维护中。"
             }
 
+    async def generate_llm_tool_reply(self, event: AstrMessageEvent, title: str, data) -> str:
+        try:
+            provider_id = await self.context.get_current_chat_provider_id(event.unified_msg_origin)
+            persona = self.context.persona_manager.get_default_persona_v3(umo=event.unified_msg_origin)
+            if asyncio.iscoroutine(persona):
+                persona = await persona
+            persona_prompt = ""
+            if isinstance(persona, dict):
+                persona_prompt = persona.get("prompt", "")
+            else:
+                persona_prompt = getattr(persona, "prompt", "")
+
+            prompt = (
+                f"你正在扮演当前 AstrBot 人格，请严格遵守下面的人格设定来回复用户。\n"
+                f"【当前人格设定】\n{persona_prompt}\n\n"
+                f"【任务】\n"
+                f"请基于插件查询到的 {title} 数据，用自然语言给用户一个简洁、有帮助的回复。\n"
+                f"不要逐字段复述 JSON，不要编造数据；如果数据中包含 error 或 ok=false，请直接说明查询失败原因。\n\n"
+                f"【查询结果 JSON】\n"
+                f"{json.dumps(data, ensure_ascii=False)}"
+            )
+            llm_resp = await self.context.llm_generate(
+                chat_provider_id=provider_id,
+                prompt=prompt
+            )
+            return llm_resp.completion_text
+        except Exception as e:
+            logger.error(f"生成 R6 LLM Tool 回复失败: {type(e).__name__}: {e}")
+            return json.dumps(data, ensure_ascii=False)
+
     @filter.command("r6")
     async def r6_command(self, event: AstrMessageEvent, message: str = ""):
         '''查询 R6S 战绩: /R6 [-g] [-h] <id1> <id2>'''
@@ -342,7 +372,8 @@ class R6StatesPlugin(Star):
             player_id(string): 玩家的育碧(Ubisoft)游戏ID
         '''
         data = await self.query_player_overview_raw(player_id)
-        yield event.plain_result(json.dumps(data, ensure_ascii=False))
+        res = await self.generate_llm_tool_reply(event, f"玩家 {player_id} 战绩", data)
+        yield event.plain_result(res)
 
     @filter.llm_tool(name="query_r6_esports_matches")
     async def query_r6_esports_matches(self, event: AstrMessageEvent, query: str):
@@ -356,7 +387,8 @@ class R6StatesPlugin(Star):
             yield event.plain_result("❌ 未配置 pandascore_api_key。")
             return
         data = await fetch_pandascore_matches(query, api_key)
-        yield event.plain_result(json.dumps(data, ensure_ascii=False))
+        res = await self.generate_llm_tool_reply(event, f"彩虹六号电竞比赛（{query}）", data)
+        yield event.plain_result(res)
 
     @filter.llm_tool(name="query_r6_operator_info")
     async def query_r6_operator_info(self, event: AstrMessageEvent, operator_name: str):
@@ -367,7 +399,8 @@ class R6StatesPlugin(Star):
         '''
         api_key = self.config.get("api_key", "")
         data = await fetch_r6_wiki("operators", api_key, params={"name": operator_name})
-        yield event.plain_result(json.dumps(data, ensure_ascii=False))
+        res = await self.generate_llm_tool_reply(event, f"干员 {operator_name} 百科", data)
+        yield event.plain_result(res)
 
 
     @filter.llm_tool(name="query_r6_game_online_status")
@@ -375,4 +408,5 @@ class R6StatesPlugin(Star):
         '''查看彩虹六号当前全球各平台的实时在线人数和注册用户统计。'''
         api_key = self.config.get("api_key", "")
         data = await fetch_game_online_stats(api_key)
-        yield event.plain_result(json.dumps(data, ensure_ascii=False))
+        res = await self.generate_llm_tool_reply(event, "游戏在线状态", data)
+        yield event.plain_result(res)
